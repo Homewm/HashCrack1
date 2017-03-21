@@ -1,0 +1,131 @@
+import pyvex
+import archinfo
+import cle
+from z3 import *
+ld = cle.Loader("HelloWorld")
+
+Not_handle_tag = ["Ist_IMark","Ist_AbiHint"]
+var_allocate = {}
+def getIRSBfromBin(addr, data_len = 0x100):
+
+    some_text_data =  "".join(ld.memory.read_bytes(addr, data_len))
+    irsb = pyvex.IRSB(some_text_data, addr, ld.main_bin.arch)
+    return irsb
+
+def extrUit(ss):
+    ss = str(ss)
+    p1 = ss.find("(")
+    p2 = ss.find(")")
+    if(p1<0 or p2<0):
+        return ss
+    return ss[p1+1:p2]
+def IRtoZ3expr(var): # if var is number , return a number , else return a z3expr
+    x = str(var)
+    if ("0x" in x):
+        return int(x, 16)
+    else:
+        if (x not in var_allocate):
+            strcmd = "%s = Int('%s')" % (x, x)
+            exec strcmd
+            var_allocate["%s" % x] = eval(x)
+            return eval(x)
+        else:
+            return var_allocate["%s" % x]
+
+# translate a IR word from pyvex to z3 expression
+def handlesinwor(pyvex_word):
+    if(pyvex_word.tag  not in Not_handle_tag):
+        word_str = str(pyvex_word)
+        # change offset=12 => offset12
+        p_offset = word_str.find("offset")
+        if(p_offset>0):
+            word_str = word_str[0:p_offset+6]+word_str[p_offset+7:]
+        # print word_str
+        # find symbols: = ( ) position
+        p1 = word_str.find("=")
+        left = word_str[0:p1-1]
+        right_b = word_str[p1+2:]
+        left = extrUit(left)
+        right_b = extrUit(right_b)
+        # print left+right_b
+        if("GET" in word_str):  # t0 = GET:I64(offset=56) => t0 = offset56
+            return IRtoZ3expr(left) == IRtoZ3expr(right_b)
+        elif("Sub" in word_str):# t6 = Sub64(t7,0x0000000000000008) => t6 = t7-0x0000000000000008
+            pp = right_b.find(",")
+            subl = right_b[0:pp]
+            subr = right_b[pp+1:]
+            return IRtoZ3expr(left) == IRtoZ3expr(subl) - IRtoZ3expr(subr)
+        elif("Add" in word_str):# t9 = Add64(t6,0xffffffffffffffe8) => t9 = t6+0xffffffffffffffe8
+            pp = right_b.find(",")
+            subl = right_b[0:pp]
+            subr = right_b[pp+1:]
+            return IRtoZ3expr(left) == IRtoZ3expr(subl) + IRtoZ3expr(subr)
+        elif("LDle" in word_str):
+            return IRtoZ3expr(left)   == IRtoZ3expr(right_b+"_memory")
+        elif("PUT" in word_str):#PUT(offset=48) = t6 => offset48 = t6
+            return  IRtoZ3expr(left) == IRtoZ3expr(right_b)
+        elif("STle" in word_str):#STle(t6) = t0 => [t6]=t0!!!!!!!!!!!!!
+            return IRtoZ3expr(left+"_memory") == IRtoZ3expr(right_b)
+        elif ("Mul" in word_str):
+            pp = right_b.find(",")
+            subl = right_b[0:pp]
+            subr = right_b[pp + 1:]
+            return IRtoZ3expr(left) ==  IRtoZ3expr(subl)  *  IRtoZ3expr(subr)
+        elif("And" in word_str):
+            pp = right_b.find(",")
+            subl = right_b[0:pp]
+            subr = right_b[pp + 1:]
+            return IRtoZ3expr(left)  ==  IRtoZ3expr(subl)  and  IRtoZ3expr(subr)
+        elif("CmpEQ" in word_str):
+            pp = right_b.find(",")
+            subl = right_b[0:pp]
+            subr = right_b[pp + 1:]
+            return IRtoZ3expr(left) == (IRtoZ3expr(subl) ==  IRtoZ3expr(subr))
+        elif("Shr" in word_str):
+            pp = right_b.find(",")
+            subl = right_b[0:pp]
+            subr = right_b[pp + 1:]
+            return IRtoZ3expr(left) ==  IRtoZ3expr(subl)*16**IRtoZ3expr(subr)
+        else:
+            return IRtoZ3expr(left) == IRtoZ3expr(right_b)
+    else:
+        return False
+
+addr = 0x4005A2
+addr_go =[]
+addr_not_go = []
+addr_not_go.append(addr)
+z3_expr = []
+# find all blocks in hash function
+while (len(addr_not_go)):
+    if addr_not_go[0] not in addr_go:
+        irsb = getIRSBfromBin(addr_not_go[0])
+        # print irsb.pp()
+        stm_used = irsb.stmts_used
+        for i in range(stm_used):
+            simwor = handlesinwor(irsb.statements[i])
+            z3_expr.append(simwor)
+            # print irsb.statements[i]
+            # print handlesinwor(irsb.statements[i])
+        addr_go.append(addr_not_go[0])
+        del addr_not_go[0]
+        nextmove = irsb.constant_jump_targets
+        for addr in  nextmove:
+            if addr not in addr_go:
+                addr_not_go.append(addr)
+        # print [hex(int(x)) for x in addr_not_go]
+    else:
+        del addr_not_go[0]
+print z3_expr
+
+# for i in range(100):
+#     strcmd = "t%s = Int('t%s')" %(i,i)
+#     exec strcmd
+#     eval("t%s" % i)
+# for i in range(100):
+#     strcmd = "offset%s = Int('offset%s')" %(i,i)
+#     exec strcmd
+#     eval("offset%s" % i)
+s = Solver()
+s.add(z3_expr)
+print s.check()
